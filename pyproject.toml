@@ -1,0 +1,22 @@
+[project]
+name = "iceberg-compaction"
+version = "0.1.0"
+description = "Iceberg Compaction Job"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyiceberg[pyarrow]>=0.12.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyiceberg[sql-sqlite]>=0.12.0",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["tests"]
