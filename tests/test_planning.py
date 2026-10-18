@@ -1,29 +1,33 @@
-from helpers import append_files, create_table
+from helpers import BY_CATEGORY, append_files, create_table
 
 from iceberg_compaction import Planner
 
 
-def test_small_files_are_merged(catalog):
+def list_groups(plan):
+    return [(group.partition_path, len(group.data_files)) for group in plan.groups]
+
+
+def test_small_files_are_merged_per_partition_when_it_saves_files(catalog):
+    table = create_table(catalog, BY_CATEGORY)
+    append_files(table, 2, category="a")
+    append_files(table, category="b")
+    append_files(table, rows=50_000, category="c")
+    append_files(table, 2, category="c")
+
+    assert list_groups(Planner(target_file_size_mib=1).plan(table)) == [("category=a", 2), ("category=c", 2)]
+
+
+def test_target_defaults_to_the_table_property(catalog):
     table = create_table(catalog)
-    append_files(table, 2)
+    with table.transaction() as transaction:
+        transaction.set_properties({"write.target-file-size-bytes": str(1024**2)})
 
-    plan = Planner(target_file_size_mib=1).plan(table)
-
-    assert len(plan.data_files) == 2
-
-
-def test_lone_small_file_is_not_rewritten(catalog):
-    table = create_table(catalog)
-    append_files(table)
-
-    assert Planner(target_file_size_mib=1).plan(table).data_files == ()
+    assert Planner().plan(table).target_file_size_bytes == 1024**2
 
 
-def test_files_over_the_target_are_not_selected(catalog):
-    table = create_table(catalog)
-    append_files(table, rows=50_000)
-    append_files(table, 2)
+def test_partition_filter_keeps_matching_partitions(catalog):
+    table = create_table(catalog, BY_CATEGORY)
+    append_files(table, 2, category="a")
+    append_files(table, 2, category="b")
 
-    plan = Planner(target_file_size_mib=1).plan(table)
-
-    assert sorted(data_file.record_count for data_file in plan.data_files) == [100, 100]
+    assert list_groups(Planner(target_file_size_mib=1, partition_filter={"category": ["b"]}).plan(table)) == [("category=b", 2)]

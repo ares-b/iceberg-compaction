@@ -1,3 +1,8 @@
-from iceberg_compaction.planning import CompactionPlan, Planner
+from iceberg_compaction.planning import (
+    CompactionPlan,
+    FileGroup,
+    HivePartitionFilter,
+    Planner,
+)
 
-__all__ = ["CompactionPlan", "Planner"]
+__all__ = ["CompactionPlan", "FileGroup", "HivePartitionFilter", "Planner"]
