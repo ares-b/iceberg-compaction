@@ -177,7 +177,8 @@ class Planner(LoggingMixin, compaction_phase="plan"):
                 partition_path=spec.partition_to_path(partition, planned_table.schema()),
                 data_files=data_files,
                 position_deletes=files.position_deletes_by_partition.get((spec.spec_id, partition), []),
-                equality_deletes=files.equality_deletes_by_partition.get((spec.spec_id, partition), []) + files.global_equality_deletes,
+                equality_deletes=files.equality_deletes_by_partition.get((spec.spec_id, partition), [])
+                + files.global_equality_deletes,
                 target_file_size_bytes=target_file_size_bytes,
                 table_name=table_name,
             )
