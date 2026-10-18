@@ -14,7 +14,14 @@ def test_logs_one_json_event(caplog):
 
     event = json.loads(caplog.messages[0])
     del event["timestamp"]
-    assert event == {"level": "INFO", "logger": "test_log.Job", "compaction_phase": "plan", "table": "db.events", "message": "Planned", "files": 3}
+    assert event == {
+        "level": "INFO",
+        "logger": "test_log.Job",
+        "compaction_phase": "plan",
+        "table": "db.events",
+        "message": "Planned",
+        "files": 3,
+    }
 
 
 def test_exception_keeps_the_traceback_in_the_json(caplog):

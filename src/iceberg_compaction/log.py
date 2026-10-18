@@ -46,7 +46,6 @@ class Logger:
 
 
 class LoggingMixin:
-
     log: Logger
 
     def __init_subclass__(cls, compaction_phase: str, **kwargs: Any) -> None:
