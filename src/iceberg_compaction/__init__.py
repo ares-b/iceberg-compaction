@@ -1,5 +1,6 @@
 from iceberg_compaction.errors import UnsupportedDataFileTypeError, UnsupportedTableFormatVersionError
 from iceberg_compaction.planning import (
+    CompactionMode,
     CompactionPlan,
     CompactionTask,
     HivePartitionFilter,
@@ -10,6 +11,7 @@ from iceberg_compaction.planning import (
 )
 
 __all__ = [
+    "CompactionMode",
     "CompactionPlan",
     "CompactionTask",
     "HivePartitionFilter",

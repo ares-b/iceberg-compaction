@@ -13,7 +13,7 @@ from pyiceberg.manifest import DataFile, DataFileContent, FileFormat
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID
 from pyiceberg.typedef import Record
 
-from iceberg_compaction import Planner, Strategy, UnsupportedDataFileTypeError
+from iceberg_compaction import CompactionMode, Planner, Strategy, UnsupportedDataFileTypeError
 from iceberg_compaction.planning import (
     CompactionTask,
     PlanMetrics,
@@ -43,6 +43,22 @@ def test_small_files_are_merged_per_partition_when_it_saves_files(catalog):
     append_files(table, 2, category="c")
 
     assert list_tasks(Planner(target_file_size_mib=1).plan(table)) == [("category=a", 2), ("category=c", 2)]
+
+
+def test_oversized_files_are_split_in_split_mode(catalog):
+    table = create_table(catalog)
+    append_files(table, rows=100_000)
+
+    (task,) = Planner(compaction_mode=CompactionMode.SPLIT, target_file_size_mib=1).plan(table).tasks
+
+    assert task.estimated_output_files == 3
+
+
+def test_files_above_the_min_size_ratio_are_not_merged(catalog):
+    table = create_table(catalog)
+    append_files(table, 3, rows=30_000)
+
+    assert Planner(min_file_size_ratio=0.5, target_file_size_mib=1).plan(table).tasks == ()
 
 
 def test_target_defaults_to_the_table_property(catalog):
@@ -179,29 +195,42 @@ def test_position_deletes_apply_from_their_own_commit_equality_deletes_only_to_o
 
 
 @pytest.mark.parametrize(
-    ("strategy", "small_only", "deletes_only", "neither"),
+    ("strategy", "compaction_mode", "is_small", "is_oversized", "has_deletes", "expected"),
     [
-        (Strategy.SMALL_FILES, True, False, False),
-        (Strategy.FILES_WITH_DELETES, False, True, False),
-        (Strategy.AUTO, True, True, False),
-        (Strategy.FULL, True, True, True),
+        (Strategy.FILE_SIZE, CompactionMode.MERGE, True, False, False, True),
+        (Strategy.FILE_SIZE, CompactionMode.MERGE, False, True, False, False),
+        (Strategy.FILE_SIZE, CompactionMode.SPLIT, True, False, False, False),
+        (Strategy.FILE_SIZE, CompactionMode.SPLIT, False, True, False, True),
+        (Strategy.FILE_SIZE, CompactionMode.BOTH, True, False, False, True),
+        (Strategy.FILE_SIZE, CompactionMode.BOTH, False, True, False, True),
+        (Strategy.FILE_SIZE, CompactionMode.BOTH, False, False, True, False),
+        (Strategy.FILES_WITH_DELETES, CompactionMode.BOTH, True, True, False, False),
+        (Strategy.FILES_WITH_DELETES, CompactionMode.MERGE, False, False, True, True),
+        (Strategy.AUTO, CompactionMode.SPLIT, False, True, False, True),
+        (Strategy.FULL, CompactionMode.MERGE, False, False, False, True),
     ],
 )
-def test_strategy_selects_candidates(strategy, small_only, deletes_only, neither):
-    assert (
-        is_candidate(strategy, is_small=True, has_deletes=False),
-        is_candidate(strategy, is_small=False, has_deletes=True),
-        is_candidate(strategy, is_small=False, has_deletes=False),
-    ) == (small_only, deletes_only, neither)
+def test_strategy_and_mode_select_candidates(strategy, compaction_mode, is_small, is_oversized, has_deletes, expected):
+    assert is_candidate(strategy, compaction_mode, is_small, is_oversized, has_deletes) == expected
 
 
 def test_plan_metrics_compute_from_tasks():
     shared_delete = make_tracked_file("delete.parquet", size=5)
     tasks = [
         CompactionTask(
-            Record(), "", (make_tracked_file("a.parquet", size=100), make_tracked_file("b.parquet", size=100)), (shared_delete,)
+            Record(),
+            "",
+            (make_tracked_file("a.parquet", size=100), make_tracked_file("b.parquet", size=100)),
+            estimated_output_files=1,
+            position_delete_files=(shared_delete,),
         ),
-        CompactionTask(Record(), "", (make_tracked_file("c.parquet", size=50),), (shared_delete,)),
+        CompactionTask(
+            Record(),
+            "",
+            (make_tracked_file("c.parquet", size=50),),
+            estimated_output_files=2,
+            position_delete_files=(shared_delete,),
+        ),
     ]
 
     metrics = PlanMetrics.compute(tasks, data_files_in_scope=5, duration_seconds=1.0)
@@ -214,22 +243,25 @@ def test_plan_metrics_compute_from_tasks():
         data_files_skipped=2,
         bytes_to_read=260,
         bytes_to_write=250,
+        estimated_files_to_write=3,
     )
 
 
 @pytest.mark.parametrize(
-    ("strategy", "has_files_to_clean", "output_file_count", "min_task_file_count", "decision"),
+    ("strategy", "has_files_to_clean", "has_files_to_split", "estimated_output_files", "min_task_file_count", "decision"),
     [
-        (Strategy.FULL, False, 2, None, (True, "full rewrite")),
-        (Strategy.AUTO, True, 2, 10, (True, "has delete files")),
-        (Strategy.SMALL_FILES, False, 2, None, (False, "merging saves no file")),
-        (Strategy.SMALL_FILES, False, 1, 3, (False, "below the minimum task size or file count")),
-        (Strategy.SMALL_FILES, False, 1, None, (True, "merge 2 files into 1")),
+        (Strategy.FULL, False, False, 2, None, (True, "full rewrite")),
+        (Strategy.AUTO, True, False, 2, 10, (True, "has delete files")),
+        (Strategy.FILE_SIZE, False, True, 3, 10, (True, "split oversized files")),
+        (Strategy.FILE_SIZE, False, False, 2, None, (False, "merging saves no file")),
+        (Strategy.FILE_SIZE, False, False, 1, 3, (False, "below the minimum task size or file count")),
+        (Strategy.FILE_SIZE, False, False, 1, None, (True, "merge 2 files into 1")),
     ],
 )
-def test_planner_decides_which_tasks_to_keep(strategy, has_files_to_clean, output_file_count, min_task_file_count, decision):
-    task = CompactionTask(Record(), "", (make_tracked_file("a.parquet"), make_tracked_file("b.parquet")))
-
+def test_planner_decides_which_tasks_to_keep(
+    strategy, has_files_to_clean, has_files_to_split, estimated_output_files, min_task_file_count, decision
+):
+    task = CompactionTask(Record(), "", (make_tracked_file("a.parquet"), make_tracked_file("b.parquet")), estimated_output_files)
     planner = Planner(strategy=strategy, min_task_file_count=min_task_file_count)
 
-    assert planner._decide_whether_to_keep(task, has_files_to_clean, output_file_count) == decision
+    assert planner._decide_whether_to_keep(task, has_files_to_clean, has_files_to_split) == decision

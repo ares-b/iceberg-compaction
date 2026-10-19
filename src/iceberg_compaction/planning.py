@@ -31,18 +31,32 @@ type CompactionTaskDecision = tuple[bool, str]
 
 
 class Strategy(StrEnum):
-    SMALL_FILES = "small-files"
+    FILE_SIZE = "file-size"
     FILES_WITH_DELETES = "files-with-deletes"
     AUTO = "auto"
     FULL = "full"
 
     @property
-    def selects_small_files(self) -> bool:
-        return self in (Strategy.SMALL_FILES, Strategy.AUTO, Strategy.FULL)
+    def selects_by_file_size(self) -> bool:
+        return self in (Strategy.FILE_SIZE, Strategy.AUTO, Strategy.FULL)
 
     @property
     def selects_files_with_deletes(self) -> bool:
         return self in (Strategy.FILES_WITH_DELETES, Strategy.AUTO, Strategy.FULL)
+
+
+class CompactionMode(StrEnum):
+    MERGE = "merge"
+    SPLIT = "split"
+    BOTH = "both"
+
+    @property
+    def merges_small_files(self) -> bool:
+        return self in (CompactionMode.MERGE, CompactionMode.BOTH)
+
+    @property
+    def splits_oversized_files(self) -> bool:
+        return self in (CompactionMode.SPLIT, CompactionMode.BOTH)
 
 
 @dataclass(frozen=True)
@@ -56,6 +70,7 @@ class CompactionTask:
     partition: Record
     partition_path: str
     data_files: tuple[TrackedFile, ...]
+    estimated_output_files: int
     position_delete_files: tuple[TrackedFile, ...] = ()
     equality_delete_files: tuple[TrackedFile, ...] = ()
 
@@ -77,6 +92,7 @@ class PlanMetrics:
     data_files_skipped: int
     bytes_to_read: int
     bytes_to_write: int
+    estimated_files_to_write: int
 
     @classmethod
     def compute(cls, tasks: list[CompactionTask], data_files_in_scope: int, duration_seconds: float) -> Self:
@@ -91,6 +107,7 @@ class PlanMetrics:
                 task.data_bytes + sum(delete_file.file.file_size_in_bytes for delete_file in task.delete_files) for task in tasks
             ),
             bytes_to_write=sum(task.data_bytes for task in tasks),
+            estimated_files_to_write=sum(task.estimated_output_files for task in tasks),
         )
 
 
@@ -119,7 +136,10 @@ class CompactionPlan:
 class Planner(LoggingMixin, compaction_phase="plan"):
     def __init__(
         self,
-        strategy: Strategy = Strategy.SMALL_FILES,
+        strategy: Strategy = Strategy.FILE_SIZE,
+        compaction_mode: CompactionMode = CompactionMode.MERGE,
+        min_file_size_ratio: float = 1.0,
+        max_file_size_ratio: float = 1.8,
         branch: str = MAIN_BRANCH,
         partition_filter: HivePartitionFilter | None = None,
         target_file_size_mib: int | None = None,
@@ -137,7 +157,14 @@ class Planner(LoggingMixin, compaction_phase="plan"):
         ):
             if value is not None and value < minimum:
                 raise ValueError(f"{name} must be >= {minimum}, got {value}")
+        if not 0 < min_file_size_ratio <= 1:
+            raise ValueError(f"min_file_size_ratio must be > 0 and <= 1, got {min_file_size_ratio}")
+        if max_file_size_ratio <= 1:
+            raise ValueError(f"max_file_size_ratio must be > 1, got {max_file_size_ratio}")
         self.strategy = Strategy(strategy)
+        self.compaction_mode = CompactionMode(compaction_mode)
+        self.min_file_size_ratio = min_file_size_ratio
+        self.max_file_size_ratio = max_file_size_ratio
         self.branch = branch
         self.partition_filter = partition_filter or {}
         self.target_file_size_mib = target_file_size_mib
@@ -188,10 +215,12 @@ class Planner(LoggingMixin, compaction_phase="plan"):
         self.log.info(
             f"Plan OK. Tasks: {metrics.tasks}, files to rewrite: {metrics.data_files_to_rewrite}, "
             f"delete files: {metrics.delete_files_to_apply}, files skipped: {metrics.data_files_skipped}, "
+            f"estimated files to write: {metrics.estimated_files_to_write}, "
             f"to read: {metrics.bytes_to_read / MIB_TO_BYTES:.1f} MiB, took {metrics.duration_seconds:.2f}s",
             table=table_name,
             branch=self.branch,
             strategy=str(self.strategy),
+            compaction_mode=str(self.compaction_mode),
             snapshot_id=snapshot.snapshot_id,
             target_file_size_bytes=target_file_size_bytes,
             **asdict(metrics),
@@ -278,19 +307,23 @@ class Planner(LoggingMixin, compaction_phase="plan"):
         position_deletes_by_data_path: dict[str, list[TrackedFile]] = {}
         equality_deletes_by_data_path: dict[str, list[TrackedFile]] = {}
         data_paths_to_clean: set[str] = set()
+        data_paths_to_split: set[str] = set()
         for data_file in data_files:
             data_path = data_file.file.file_path
             applicable_position_deletes, applicable_equality_deletes = find_applicable_deletes(
                 data_file, position_deletes, equality_deletes
             )
-            is_small = data_file.file.file_size_in_bytes < target_file_size_bytes
+            is_small = data_file.file.file_size_in_bytes < target_file_size_bytes * self.min_file_size_ratio
+            is_oversized = data_file.file.file_size_in_bytes > target_file_size_bytes * self.max_file_size_ratio
             has_deletes = len(applicable_position_deletes) + len(applicable_equality_deletes) >= self.min_delete_file_count
-            if is_candidate(self.strategy, is_small, has_deletes):
+            if is_candidate(self.strategy, self.compaction_mode, is_small, is_oversized, has_deletes):
                 candidates.append(data_file)
                 position_deletes_by_data_path[data_path] = applicable_position_deletes
                 equality_deletes_by_data_path[data_path] = applicable_equality_deletes
                 if has_deletes and self.strategy.selects_files_with_deletes:
                     data_paths_to_clean.add(data_path)
+                if is_oversized and self.strategy.selects_by_file_size and self.compaction_mode.splits_oversized_files:
+                    data_paths_to_split.add(data_path)
 
         tasks = []
         for task_data_files in pack_into_tasks(candidates, self.max_task_size_bytes):
@@ -299,6 +332,9 @@ class Planner(LoggingMixin, compaction_phase="plan"):
                 partition=partition,
                 partition_path=partition_path,
                 data_files=tuple(task_data_files),
+                estimated_output_files=math.ceil(
+                    sum(data_file.file.file_size_in_bytes for data_file in task_data_files) / target_file_size_bytes
+                ),
                 position_delete_files=tuple(
                     {
                         delete.file.file_path: delete for path in task_paths for delete in position_deletes_by_data_path[path]
@@ -310,9 +346,8 @@ class Planner(LoggingMixin, compaction_phase="plan"):
                     }.values()
                 ),
             )
-            output_file_count = math.ceil(task.data_bytes / target_file_size_bytes)
             is_kept, reason = self._decide_whether_to_keep(
-                task, bool(data_paths_to_clean.intersection(task_paths)), output_file_count
+                task, bool(data_paths_to_clean.intersection(task_paths)), bool(data_paths_to_split.intersection(task_paths))
             )
             summary = (
                 f"partition {partition_path or 'unpartitioned'}. Files: {len(task.data_files)}, "
@@ -323,7 +358,7 @@ class Planner(LoggingMixin, compaction_phase="plan"):
                 "data_files": len(task.data_files),
                 "data_bytes": task.data_bytes,
                 "delete_files": len(task.delete_files),
-                "output_files": output_file_count,
+                "estimated_output_files": task.estimated_output_files,
                 "reason": reason,
             }
             if is_kept:
@@ -334,19 +369,21 @@ class Planner(LoggingMixin, compaction_phase="plan"):
         return tasks
 
     def _decide_whether_to_keep(
-        self, task: CompactionTask, has_files_to_clean: bool, output_file_count: int
+        self, task: CompactionTask, has_files_to_clean: bool, has_files_to_split: bool
     ) -> CompactionTaskDecision:
         if self.strategy == Strategy.FULL:
             return True, "full rewrite"
         if has_files_to_clean:
             return True, "has delete files"
-        if output_file_count >= len(task.data_files):
+        if has_files_to_split:
+            return True, "split oversized files"
+        if task.estimated_output_files >= len(task.data_files):
             return False, "merging saves no file"
         if (self.min_task_size_bytes is not None and task.data_bytes < self.min_task_size_bytes) or (
             self.min_task_file_count is not None and len(task.data_files) < self.min_task_file_count
         ):
             return False, "below the minimum task size or file count"
-        return True, f"merge {len(task.data_files)} files into {output_file_count}"
+        return True, f"merge {len(task.data_files)} files into {task.estimated_output_files}"
 
     def _resolve_target_file_size(self, table: Table, table_name: str) -> int:
         writer_target_file_size_bytes = int(
@@ -401,10 +438,15 @@ def find_applicable_deletes(
     )
 
 
-def is_candidate(strategy: Strategy, is_small: bool, has_deletes: bool) -> bool:
+def is_candidate(
+    strategy: Strategy, compaction_mode: CompactionMode, is_small: bool, is_oversized: bool, has_deletes: bool
+) -> bool:
+    has_size_to_fix = (is_small and compaction_mode.merges_small_files) or (
+        is_oversized and compaction_mode.splits_oversized_files
+    )
     return (
         strategy == Strategy.FULL
-        or (is_small and strategy.selects_small_files)
+        or (has_size_to_fix and strategy.selects_by_file_size)
         or (has_deletes and strategy.selects_files_with_deletes)
     )
 
