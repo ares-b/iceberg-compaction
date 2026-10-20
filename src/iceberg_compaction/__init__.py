@@ -1,4 +1,8 @@
-from iceberg_compaction.errors import UnsupportedDataFileTypeError, UnsupportedTableFormatVersionError
+from iceberg_compaction.errors import (
+    RowCountMismatchError,
+    UnsupportedDataFileTypeError,
+    UnsupportedTableFormatVersionError,
+)
 from iceberg_compaction.execution import CompactionEngine, Execution, ExecutionResult, RewriteJob, RewrittenTask
 from iceberg_compaction.planning import (
     CompactionMode,
@@ -23,6 +27,7 @@ __all__ = [
     "Planner",
     "RewriteJob",
     "RewrittenTask",
+    "RowCountMismatchError",
     "Strategy",
     "TrackedFile",
     "UnsupportedDataFileTypeError",

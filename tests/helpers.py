@@ -51,10 +51,10 @@ def list_live_data_files(table: Table) -> list[DataFile]:
     ]
 
 
-def add_delete_file(table: Table, content: DataFileContent, rows: pa.Table, partition: Record, equality_ids=None) -> None:
-    path = f"{table.location()}/data/deletes-{uuid.uuid4()}.parquet"
+def write_file(table: Table, content: DataFileContent, rows: pa.Table, partition: Record, equality_ids=None) -> DataFile:
+    path = f"{table.location()}/data/{content.name.lower()}-{uuid.uuid4()}.parquet"
     pq.write_table(rows, path.removeprefix("file://"))
-    delete_file = DataFile.from_args(
+    return DataFile.from_args(
         content=content,
         file_path=path,
         file_format=FileFormat.PARQUET,
@@ -64,8 +64,16 @@ def add_delete_file(table: Table, content: DataFileContent, rows: pa.Table, part
         spec_id=table.spec().spec_id,
         equality_ids=equality_ids,
     )
+
+
+def commit_files(table: Table, *files: DataFile) -> None:
     with table.transaction() as transaction, transaction.update_snapshot().fast_append() as append:
-        append.append_data_file(delete_file)
+        for file in files:
+            append.append_data_file(file)
+
+
+def add_delete_file(table: Table, content: DataFileContent, rows: pa.Table, partition: Record, equality_ids=None) -> None:
+    commit_files(table, write_file(table, content, rows, partition, equality_ids))
 
 
 def add_position_deletes(table: Table, data_file: DataFile, positions: list[int]) -> None:
@@ -83,3 +91,12 @@ def add_equality_deletes(table: Table, column: str, values: list, partition: Rec
     key_field = table.schema().find_field(column)
     rows = pa.Table.from_pydict({column: values}, schema=schema_to_pyarrow(Schema(key_field)))
     add_delete_file(table, DataFileContent.EQUALITY_DELETES, rows, partition or Record(), equality_ids=[key_field.field_id])
+
+
+def upsert_row(table: Table, row: dict) -> None:
+    """Replace the row with the same id: a new data file and an equality delete on id, in one commit."""
+    key_field = table.schema().find_field("id")
+    data_file = write_file(table, DataFileContent.DATA, pa.Table.from_pylist([row], schema=table.schema().as_arrow()), Record())
+    delete_rows = pa.Table.from_pydict({"id": [row["id"]]}, schema=schema_to_pyarrow(Schema(key_field)))
+    delete_file = write_file(table, DataFileContent.EQUALITY_DELETES, delete_rows, Record(), equality_ids=[key_field.field_id])
+    commit_files(table, data_file, delete_file)
