@@ -7,6 +7,7 @@ from iceberg_compaction.planning import MIB_TO_BYTES, TrackedFile
 
 COPY_BUFFER_BYTES = 8 * MIB_TO_BYTES
 
+
 # TODO: engines should read parquet files directly (FileIO or https or whatever)
 def stage_files(io: FileIO, files: tuple[TrackedFile, ...], staging_dir: str, name: str) -> list[str]:
     local_paths = []
