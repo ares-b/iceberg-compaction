@@ -1,7 +1,6 @@
 import tempfile
 from collections.abc import Generator
 from contextlib import closing, contextmanager
-from typing import Self
 
 import duckdb
 import pyarrow as pa
@@ -28,7 +27,7 @@ from pyiceberg.types import (
 )
 
 from iceberg_compaction.engines.staging import stage_files
-from iceberg_compaction.execution import RewriteJob
+from iceberg_compaction.execution import CompactionEngine, RewriteJob
 
 PRIMITIVE_SQL_TYPES: dict[type[IcebergType], str] = {
     BooleanType: "BOOLEAN",
@@ -47,16 +46,10 @@ PRIMITIVE_SQL_TYPES: dict[type[IcebergType], str] = {
 }
 
 
-class DuckDBEngine:
+class DuckDBEngine(CompactionEngine):
     def __init__(self, staging_dir: str | None = None):
         self.staging_dir = staging_dir
         self._connection = duckdb.connect(config={"TimeZone": "UTC", "arrow_lossless_conversion": True})
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
 
     def close(self) -> None:
         self._connection.close()

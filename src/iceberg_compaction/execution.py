@@ -1,8 +1,9 @@
 import time
 import uuid
+from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import IO, Any, Protocol, cast
+from typing import IO, Any, Self, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -31,10 +32,19 @@ class RewriteJob:
     data_files: tuple[TrackedFile, ...]
 
 
-class CompactionEngine(Protocol):
+class CompactionEngine(ABC):
+    @abstractmethod
     def read_rows(self, job: RewriteJob) -> AbstractContextManager[pa.RecordBatchReader]:
         """Stream the rows of the job's data files, columns of the job's schema matched by field id."""
-        ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
