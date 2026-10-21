@@ -1,11 +1,12 @@
 import tempfile
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Iterable, Sequence
 from contextlib import closing, contextmanager
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
+from jinja2 import Environment, PackageLoader, StrictUndefined
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID
 from pyiceberg.types import (
     BinaryType,
@@ -35,9 +36,16 @@ from iceberg_compaction.planning import TrackedFile
 
 SOURCE_FILE_COLUMN = "__source_file"
 ROW_POSITION_COLUMN = "file_row_number"
-POSITION_DELETE_READ_SCHEMA = (
-    f"MAP {{{PATH_FIELD_ID}: {{name: 'file_path', type: 'VARCHAR', default_value: NULL}}, "
-    f"{PATH_FIELD_ID - 1}: {{name: 'pos', type: 'BIGINT', default_value: NULL}}}}"
+POSITION_DELETE_COLUMNS = (
+    {"field_id": PATH_FIELD_ID, "name": "'file_path'", "type": "'VARCHAR'"},
+    {"field_id": PATH_FIELD_ID - 1, "name": "'pos'", "type": "'BIGINT'"},
+)
+SQL_TEMPLATES = Environment(
+    loader=PackageLoader("iceberg_compaction.engines.duckdb_engine", "sql"),
+    undefined=StrictUndefined,
+    trim_blocks=True,
+    lstrip_blocks=True,
+    autoescape=False,
 )
 
 PRIMITIVE_SQL_TYPES: dict[type[IcebergType], str] = {
@@ -115,71 +123,64 @@ def build_query(
 ) -> str:
     if reserved_names := {schema_field.name for schema_field in job.schema.fields} & {SOURCE_FILE_COLUMN, ROW_POSITION_COLUMN}:
         raise ValueError(f"Column names reserved by the DuckDB engine: {sorted(reserved_names)}")
-    columns = ", ".join(f"d.{quote_identifier(schema_field.name)}" for schema_field in job.schema.fields)
-    query = (
-        f"SELECT {columns}\n"
-        f"FROM {build_read_parquet(data_paths, job.schema.fields)} AS d\n"
-        f"JOIN {format_files_table(data_paths, job.data_files)} AS f(local_path, original_path, sequence_number) "
-        f"ON f.local_path = d.{SOURCE_FILE_COLUMN}"
-    )
-
-    conditions = []
-    if position_delete_paths:
-        conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM read_parquet({format_list_literal(position_delete_paths)}, "
-            f"schema={POSITION_DELETE_READ_SCHEMA}) AS p WHERE p.file_path = f.original_path AND p.pos = d.{ROW_POSITION_COLUMN})"
-        )
     top_level_fields = {schema_field.field_id: schema_field for schema_field in job.schema.fields}
-    equality_ids = {tuple(delete_file.file.equality_ids or ()) for delete_file in job.equality_delete_files}
-    for ids in equality_ids:
-        if not set(ids) <= top_level_fields.keys():
-            raise NotImplementedError(f"Equality deletes on nested or dropped field ids are not supported: {ids}")
-        key_fields = tuple(top_level_fields[field_id] for field_id in ids)
-        layout = [
+    equality_deletes = []
+    for equality_ids in {tuple(delete_file.file.equality_ids or ()) for delete_file in job.equality_delete_files}:
+        if not set(equality_ids) <= top_level_fields.keys():
+            raise NotImplementedError(f"Equality deletes on nested or dropped field ids are not supported: {equality_ids}")
+        paths_and_files = [
             (path, delete_file)
             for path, delete_file in zip(equality_delete_paths, job.equality_delete_files, strict=True)
-            if tuple(delete_file.file.equality_ids or ()) == ids
+            if tuple(delete_file.file.equality_ids or ()) == equality_ids
         ]
-        paths = [path for path, _ in layout]
-        key_matches = " AND ".join(
-            f"e.{quote_identifier(key.name)} IS NOT DISTINCT FROM d.{quote_identifier(key.name)}" for key in key_fields
+        equality_deletes.append(
+            {
+                "paths": [quote_literal(path) for path, _ in paths_and_files],
+                "files": format_files([path for path, _ in paths_and_files], [delete_file for _, delete_file in paths_and_files]),
+                "key_columns": format_columns([top_level_fields[field_id] for field_id in equality_ids]),
+            }
         )
-        conditions.append(
-            f"NOT EXISTS (SELECT 1 FROM {build_read_parquet(paths, key_fields)} AS e "
-            f"JOIN {format_files_table(paths, [delete_file for _, delete_file in layout])} "
-            f"AS ef(local_path, original_path, sequence_number) ON ef.local_path = e.{SOURCE_FILE_COLUMN} "
-            f"WHERE {key_matches} AND ef.sequence_number > f.sequence_number)"
-        )
-    if conditions:
-        query += "\nWHERE " + "\n  AND ".join(conditions)
-
-    if job.sort_columns:
-        query += "\nORDER BY " + ", ".join(
-            f"d.{quote_identifier(column.name)} {'DESC' if column.descending else 'ASC'} "
-            f"{'NULLS FIRST' if column.nulls_first else 'NULLS LAST'}"
+    return SQL_TEMPLATES.get_template("read_rows.sql.j2").render(
+        source_file_column=SOURCE_FILE_COLUMN,
+        row_position_column=ROW_POSITION_COLUMN,
+        columns=format_columns(job.schema.fields),
+        data_paths=[quote_literal(path) for path in data_paths],
+        data_files=format_files(data_paths, job.data_files),
+        position_delete_paths=[quote_literal(path) for path in position_delete_paths],
+        position_delete_columns=POSITION_DELETE_COLUMNS,
+        equality_deletes=equality_deletes,
+        sort_columns=[
+            {
+                "identifier": quote_identifier(column.name),
+                "direction": "DESC" if column.descending else "ASC",
+                "nulls": "NULLS FIRST" if column.nulls_first else "NULLS LAST",
+            }
             for column in job.sort_columns
-        )
-    return query
+        ],
+    )
 
 
-def build_read_parquet(paths: list[str], fields: tuple[NestedField, ...]) -> str:
-    read_schema = ", ".join(
-        f"{schema_field.field_id}: {{name: {quote_literal(schema_field.name)}, "
-        f"type: {quote_literal(map_sql_type(schema_field.field_type))}, default_value: NULL}}"
+def format_columns(fields: Iterable[NestedField]) -> list[dict[str, str | int]]:
+    return [
+        {
+            "field_id": schema_field.field_id,
+            "name": quote_literal(schema_field.name),
+            "identifier": quote_identifier(schema_field.name),
+            "type": quote_literal(map_sql_type(schema_field.field_type)),
+        }
         for schema_field in fields
-    )
-    return (
-        f"read_parquet({format_list_literal(paths)}, schema=MAP {{{read_schema}}}, "
-        f"filename={quote_literal(SOURCE_FILE_COLUMN)}, file_row_number=true)"
-    )
+    ]
 
 
-def format_files_table(local_paths: list[str], files: list[TrackedFile] | tuple[TrackedFile, ...]) -> str:
-    rows = ", ".join(
-        f"({quote_literal(local_path)}, {quote_literal(tracked_file.file.file_path)}, {tracked_file.sequence_number})"
+def format_files(local_paths: list[str], files: Sequence[TrackedFile]) -> list[dict[str, str | int]]:
+    return [
+        {
+            "local_path": quote_literal(local_path),
+            "original_path": quote_literal(tracked_file.file.file_path),
+            "sequence_number": tracked_file.sequence_number,
+        }
         for local_path, tracked_file in zip(local_paths, files, strict=True)
-    )
-    return f"(VALUES {rows})"
+    ]
 
 
 def map_sql_type(field_type: IcebergType) -> str:
@@ -194,10 +195,6 @@ def map_sql_type(field_type: IcebergType) -> str:
     if type(field_type) not in PRIMITIVE_SQL_TYPES:
         raise NotImplementedError(f"Type not supported by the DuckDB engine: {field_type}")
     return PRIMITIVE_SQL_TYPES[type(field_type)]
-
-
-def format_list_literal(values: list[str]) -> str:
-    return "[" + ", ".join(quote_literal(value) for value in values) + "]"
 
 
 def quote_literal(value: str) -> str:

@@ -1,0 +1,29 @@
+{% from "macros.sql.j2" import read_parquet, files_table with context %}
+SELECT {% for column in columns %}d.{{ column.identifier }}{{ ", " if not loop.last }}{% endfor +%}
+FROM {{ read_parquet(data_paths, columns) }} AS d
+JOIN {{ files_table(data_files) }} AS f(local_path, original_path, sequence_number)
+    ON f.local_path = d.{{ source_file_column }}
+WHERE TRUE
+{% if position_delete_paths %}
+    AND NOT EXISTS (
+        SELECT 1
+        FROM {{ read_parquet(position_delete_paths, position_delete_columns) | indent(8) }} AS p
+        WHERE p.file_path = f.original_path AND p.pos = d.{{ row_position_column }}
+    )
+{% endif %}
+{% for equality_delete in equality_deletes %}
+    AND NOT EXISTS (
+        SELECT 1
+        FROM {{ read_parquet(equality_delete.paths, equality_delete.key_columns) | indent(8) }} AS e
+        JOIN {{ files_table(equality_delete.files) | indent(8) }} AS ef(local_path, original_path, sequence_number)
+            ON ef.local_path = e.{{ source_file_column }}
+        WHERE
+{% for key_column in equality_delete.key_columns %}
+            e.{{ key_column.identifier }} IS NOT DISTINCT FROM d.{{ key_column.identifier }} AND
+{% endfor %}
+            ef.sequence_number > f.sequence_number
+    )
+{% endfor %}
+{% if sort_columns %}
+ORDER BY {% for column in sort_columns %}d.{{ column.identifier }} {{ column.direction }} {{ column.nulls }}{{ ", " if not loop.last }}{% endfor +%}
+{% endif %}

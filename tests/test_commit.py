@@ -3,7 +3,7 @@ from helpers import add_position_deletes, append_files, create_table, list_live_
 from pyiceberg.exceptions import ValidationException
 
 from iceberg_compaction import Committer, Execution, Planner, compact
-from iceberg_compaction.engines import DuckDBEngine
+from iceberg_compaction.engines.duckdb_engine import DuckDBEngine
 
 
 @pytest.fixture

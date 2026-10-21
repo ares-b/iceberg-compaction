@@ -5,8 +5,13 @@ description = "Iceberg Compaction Job"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "duckdb>=1.5.6,<2",
     "pyiceberg[pyarrow]>=0.12.0,<0.13",
+]
+
+[project.optional-dependencies]
+duckdb = [
+    "duckdb>=1.5.6,<2",
+    "jinja2>=3.1,<4",
 ]
 
 [build-system]
@@ -15,6 +20,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "iceberg-compaction[duckdb]",
     "pyiceberg[sql-sqlite]>=0.12.0",
     "pytest>=9.1.1",
     "ruff>=0.17.1",

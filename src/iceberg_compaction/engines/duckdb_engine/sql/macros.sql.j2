@@ -1,0 +1,20 @@
+{% macro read_parquet(paths, columns) %}
+read_parquet(
+    [{{ paths | join(", ") }}],
+    schema = MAP {
+{% for column in columns %}
+        {{ column.field_id }}: {name: {{ column.name }}, type: {{ column.type }}, default_value: NULL}{{ "," if not loop.last }}
+{% endfor %}
+    },
+    filename = '{{ source_file_column }}',
+    file_row_number = true
+)
+{%- endmacro %}
+
+{% macro files_table(files) %}
+(VALUES
+{% for file in files %}
+    ({{ file.local_path }}, {{ file.original_path }}, {{ file.sequence_number }}){{ "," if not loop.last }}
+{% endfor %}
+)
+{%- endmacro %}

@@ -9,7 +9,7 @@ from pyiceberg.transforms import IdentityTransform
 from pyiceberg.types import StringType
 
 from iceberg_compaction import CompactionEngine, CompactionMode, Execution, Planner, RowCountMismatchError, Strategy
-from iceberg_compaction.engines import DuckDBEngine
+from iceberg_compaction.engines.duckdb_engine import DuckDBEngine
 from iceberg_compaction.execution import compute_batch_rows
 
 

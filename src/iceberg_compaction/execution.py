@@ -355,7 +355,7 @@ if __name__ == "__main__":
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.types import BinaryType, LongType, NestedField
 
-    from iceberg_compaction.engines import DuckDBEngine
+    from iceberg_compaction.engines.duckdb_engine import DuckDBEngine
     from iceberg_compaction.execution import Execution as PackageExecution
     from iceberg_compaction.planning import CompactionMode, Planner
 
