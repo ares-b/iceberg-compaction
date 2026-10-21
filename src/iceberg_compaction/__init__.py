@@ -1,3 +1,5 @@
+from iceberg_compaction.commit import Committer
+from iceberg_compaction.compaction import CompactionResult, compact
 from iceberg_compaction.errors import (
     RowCountMismatchError,
     UnsupportedDataFileTypeError,
@@ -23,9 +25,11 @@ from iceberg_compaction.planning import (
 )
 
 __all__ = [
+    "Committer",
     "CompactionEngine",
     "CompactionMode",
     "CompactionPlan",
+    "CompactionResult",
     "CompactionTask",
     "Execution",
     "ExecutionMetrics",
@@ -40,4 +44,5 @@ __all__ = [
     "TrackedFile",
     "UnsupportedDataFileTypeError",
     "UnsupportedTableFormatVersionError",
+    "compact",
 ]

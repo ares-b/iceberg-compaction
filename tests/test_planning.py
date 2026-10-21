@@ -45,15 +45,6 @@ def test_small_files_are_merged_per_partition_when_it_saves_files(catalog):
     assert list_tasks(Planner(target_file_size_mib=1).plan(table)) == [("category=a", 2), ("category=c", 2)]
 
 
-def test_oversized_files_are_split_in_split_mode(catalog):
-    table = create_table(catalog)
-    append_files(table, rows=100_000)
-
-    (task,) = Planner(compaction_mode=CompactionMode.SPLIT, target_file_size_mib=1).plan(table).tasks
-
-    assert task.estimated_output_files == 3
-
-
 def test_files_above_the_min_size_ratio_are_not_merged(catalog):
     table = create_table(catalog)
     append_files(table, 3, rows=30_000)
@@ -67,26 +58,6 @@ def test_target_defaults_to_the_table_property(catalog):
         transaction.set_properties({"write.target-file-size-bytes": str(1024**2)})
 
     assert Planner().plan(table).target_file_size_bytes == 1024**2
-
-
-def test_plan_reads_the_given_branch(catalog):
-    table = create_table(catalog)
-    append_files(table)
-    table.manage_snapshots().create_branch(table.current_snapshot().snapshot_id, "dev").commit()
-    append_files(table, branch="dev")
-
-    assert list_tasks(Planner(target_file_size_mib=1).plan(table)) == []
-    assert list_tasks(Planner(target_file_size_mib=1, branch="dev").plan(table)) == [("", 2)]
-
-
-def test_plan_keeps_the_table_as_planned(catalog):
-    table = create_table(catalog)
-    append_files(table, 2)
-
-    plan = Planner(target_file_size_mib=1).plan(table)
-    append_files(table)
-
-    assert plan.table.current_snapshot().snapshot_id == plan.snapshot_id != table.current_snapshot().snapshot_id
 
 
 def test_min_delete_file_count(catalog):

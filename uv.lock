@@ -234,8 +234,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "duckdb", specifier = ">=1.5.6" },
-    { name = "pyiceberg", extras = ["pyarrow"], specifier = ">=0.12.0" },
+    { name = "duckdb", specifier = ">=1.5.6,<2" },
+    { name = "pyiceberg", extras = ["pyarrow"], specifier = ">=0.12.0,<0.13" },
 ]
 
 [package.metadata.requires-dev]

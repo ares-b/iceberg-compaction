@@ -152,7 +152,8 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
                 table=plan.table_name,
                 written_files=len(written_paths),
             )
-            self._delete_files(plan.table.io, written_paths, plan.table_name)
+            for path in delete_files(plan.table.io, written_paths):
+                self.log.warning(f"Could not delete {path}, remove it by hand", table=plan.table_name, file_path=path)
             raise
 
         metrics = ExecutionMetrics.compute(rewritten_tasks, time.perf_counter() - started)
@@ -328,14 +329,17 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
             raise
         return data_files
 
-    def _delete_files(self, io: FileIO, paths: list[str], table_name: str) -> None:
-        for path in paths:
-            try:
-                io.delete(path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                self.log.warning(f"Could not delete {path}, remove it by hand", table=table_name, file_path=path)
+
+def delete_files(io: FileIO, paths: list[str]) -> list[str]:
+    undeleted_paths = []
+    for path in paths:
+        try:
+            io.delete(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            undeleted_paths.append(path)
+    return undeleted_paths
 
 
 def compute_batch_rows(row_group_rows_limit: int, row_group_bytes_limit: int, rows: int, uncompressed_bytes: int) -> int:
