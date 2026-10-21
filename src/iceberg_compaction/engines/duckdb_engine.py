@@ -1,9 +1,11 @@
 import tempfile
+import threading
 from collections.abc import Generator
 from contextlib import closing, contextmanager
 
 import duckdb
 import pyarrow as pa
+import pyarrow.parquet as pq
 from pyiceberg.table.delete_file_index import PATH_FIELD_ID
 from pyiceberg.types import (
     BinaryType,
@@ -28,7 +30,7 @@ from pyiceberg.types import (
 )
 
 from iceberg_compaction.engines.staging import stage_files
-from iceberg_compaction.execution import CompactionEngine, RewriteJob
+from iceberg_compaction.execution import CompactionEngine, RewriteJob, compute_batch_rows
 from iceberg_compaction.planning import TrackedFile
 
 SOURCE_FILE_COLUMN = "__source_file"
@@ -56,24 +58,56 @@ PRIMITIVE_SQL_TYPES: dict[type[IcebergType], str] = {
 
 
 class DuckDBEngine(CompactionEngine):
-    def __init__(self, staging_dir: str | None = None):
+    def __init__(
+        self,
+        memory_limit: str | None = None,
+        threads: int | None = None,
+        staging_dir: str | None = None,
+        max_concurrent_downloads: int = 8,
+    ):
         self.staging_dir = staging_dir
-        self._connection = duckdb.connect(config={"TimeZone": "UTC", "arrow_lossless_conversion": True})
+        self.max_concurrent_downloads = max_concurrent_downloads
+        self._spill_dir = tempfile.TemporaryDirectory(prefix="duckdb-spill-", dir=staging_dir)
+        config: dict[str, str | int | bool] = {
+            "TimeZone": "UTC",
+            "arrow_lossless_conversion": True,
+            "temp_directory": self._spill_dir.name,
+        }
+        if memory_limit is not None:
+            config["memory_limit"] = memory_limit
+        if threads is not None:
+            config["threads"] = threads
+        self._connection = duckdb.connect(config=config)
+        self._cursor_lock = threading.Lock()
 
     def close(self) -> None:
         self._connection.close()
+        self._spill_dir.cleanup()
 
     @contextmanager
     def read_rows(self, job: RewriteJob) -> Generator[pa.RecordBatchReader]:
-        with (
-            tempfile.TemporaryDirectory(prefix="compaction-", dir=self.staging_dir) as staging_dir,
-            closing(self._connection.cursor()) as cursor,
-        ):
-            data_paths = stage_files(job.io, job.data_files, staging_dir, "data")
-            position_delete_paths = stage_files(job.io, job.position_delete_files, staging_dir, "position-delete")
-            equality_delete_paths = stage_files(job.io, job.equality_delete_files, staging_dir, "equality-delete")
+        with self._cursor_lock:
+            cursor = self._connection.cursor()
+        with tempfile.TemporaryDirectory(prefix="compaction-", dir=self.staging_dir) as staging_dir, closing(cursor):
+            data_paths = stage_files(job.io, job.data_files, staging_dir, "data", self.max_concurrent_downloads)
+            position_delete_paths = stage_files(
+                job.io, job.position_delete_files, staging_dir, "position-delete", self.max_concurrent_downloads
+            )
+            equality_delete_paths = stage_files(
+                job.io, job.equality_delete_files, staging_dir, "equality-delete", self.max_concurrent_downloads
+            )
+            batch_rows = compute_batch_rows(job.row_group_rows_limit, job.row_group_bytes_limit, *read_size_of_rows(data_paths))
             query = build_query(job, data_paths, position_delete_paths, equality_delete_paths)
-            yield cursor.execute(query).to_arrow_reader()
+            yield cursor.execute(query).to_arrow_reader(batch_rows)
+
+
+def read_size_of_rows(paths: list[str]) -> tuple[int, int]:
+    rows = uncompressed_bytes = 0
+    for path in paths:
+        metadata = pq.read_metadata(path)
+        rows += metadata.num_rows
+        uncompressed_bytes += sum(metadata.row_group(index).total_byte_size for index in range(metadata.num_row_groups))
+    return rows, uncompressed_bytes
 
 
 def build_query(

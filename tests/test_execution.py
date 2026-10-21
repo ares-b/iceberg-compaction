@@ -10,6 +10,7 @@ from pyiceberg.types import StringType
 
 from iceberg_compaction import CompactionEngine, CompactionMode, Execution, Planner, RowCountMismatchError, Strategy
 from iceberg_compaction.engines import DuckDBEngine
+from iceberg_compaction.execution import compute_batch_rows
 
 
 @pytest.fixture
@@ -122,3 +123,16 @@ def test_row_count_mismatch_fails_and_deletes_written_files(catalog, engine, tmp
         Execution(RowDroppingEngine(engine)).execute(Planner(target_file_size_mib=1).plan(table))
 
     assert set((tmp_path / "warehouse").rglob("*.parquet")) == files_before
+
+
+@pytest.mark.parametrize(
+    ("rows", "uncompressed_bytes", "batch_rows"),
+    [(1_000, 1_000, 100), (1_000, 100_000, 10), (0, 0, 100)],
+)
+def test_compute_batch_rows_keeps_row_groups_under_both_limits(rows, uncompressed_bytes, batch_rows):
+    assert (
+        compute_batch_rows(
+            row_group_rows_limit=100, row_group_bytes_limit=1_000, rows=rows, uncompressed_bytes=uncompressed_bytes
+        )
+        == batch_rows
+    )

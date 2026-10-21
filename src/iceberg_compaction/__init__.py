@@ -3,7 +3,14 @@ from iceberg_compaction.errors import (
     UnsupportedDataFileTypeError,
     UnsupportedTableFormatVersionError,
 )
-from iceberg_compaction.execution import CompactionEngine, Execution, ExecutionResult, RewriteJob, RewrittenTask
+from iceberg_compaction.execution import (
+    CompactionEngine,
+    Execution,
+    ExecutionMetrics,
+    ExecutionResult,
+    RewriteJob,
+    RewrittenTask,
+)
 from iceberg_compaction.planning import (
     CompactionMode,
     CompactionPlan,
@@ -21,6 +28,7 @@ __all__ = [
     "CompactionPlan",
     "CompactionTask",
     "Execution",
+    "ExecutionMetrics",
     "ExecutionResult",
     "HivePartitionFilter",
     "PlanMetrics",
