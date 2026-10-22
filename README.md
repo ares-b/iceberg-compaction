@@ -190,6 +190,13 @@ sequenceDiagram
 The writer fills a file up to the target size and then starts the next one, that's how merge and split both work:
 40 small files become 1, a 1.2 GiB file becomes 3. If something fails, files written so far are deleted
 
+How files are written, for readers:
+- a file is made of full row groups (`write.parquet.row-group-size-bytes`), the writer closes a file before a row group that doesn't fit anymore. So files are a bit under the target, never with tiny row groups at the end
+- pages follow `write.parquet.page-size-bytes` and `write.parquet.page-row-limit`, dictionary follows `write.parquet.dict-size-bytes`
+- page index is written (Trino uses it to skip pages)
+- bloom filters are written for columns with `write.parquet.bloom-filter-enabled.column.<name>=true`
+- when rows are sorted, the sort is also written in the parquet footer (`sorting_columns`)
+
 ## Engines
 
 The engine only produces rows: reads files, drops deleted rows, sorts. `Execution` writes files and deals with Iceberg

@@ -1,3 +1,4 @@
+import math
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -10,7 +11,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyiceberg.io import FileIO
 from pyiceberg.io.pyarrow import (
-    _get_parquet_writer_kwargs,
     compute_statistics_plan,
     data_file_statistics_from_parquet_metadata,
     parquet_path_to_id_mapping,
@@ -22,12 +22,15 @@ from pyiceberg.schema import Schema, sanitize_column_names
 from pyiceberg.table import Table, TableProperties
 from pyiceberg.table.sorting import NullOrder, SortDirection
 from pyiceberg.transforms import IdentityTransform
-from pyiceberg.typedef import Record
+from pyiceberg.typedef import Properties, Record
 from pyiceberg.utils.properties import property_as_int
 
 from iceberg_compaction.errors import RowCountMismatchError
 from iceberg_compaction.log import LoggingMixin
 from iceberg_compaction.planning import MIB_TO_BYTES, CompactionPlan, CompactionTask, TrackedFile
+
+BLOOM_FILTER_FPP_PREFIX = "write.parquet.bloom-filter-fpp.column"
+BLOOM_FILTER_FPP_DEFAULT = 0.01
 
 
 @dataclass(frozen=True)
@@ -200,7 +203,7 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
             ),
         )
         with self.engine.read_rows(job) as reader:
-            added_files = self._write_data_files(reader, plan, task, sort_order_id, written_paths)
+            added_files = self._write_data_files(reader, plan, task, sort_columns, sort_order_id, written_paths)
 
         rows_read = sum(data_file.file.record_count for data_file in task.data_files)
         rows_written = sum(data_file.record_count for data_file in added_files)
@@ -252,6 +255,7 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
         reader: pa.RecordBatchReader,
         plan: CompactionPlan,
         task: CompactionTask,
+        sort_columns: SortColumns,
         sort_order_id: int | None,
         written_paths: list[str],
     ) -> list[DataFile]:
@@ -259,9 +263,8 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
         spec = table.spec()
         file_schema = sanitize_column_names(table.schema())
         arrow_schema = schema_to_pyarrow(file_schema, include_field_ids=True)
-        writer_kwargs = _get_parquet_writer_kwargs(
-            {key: value for key, value in table.properties.items() if key != TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES}
-        )
+        rows_read = sum(data_file.file.record_count for data_file in task.data_files)
+        writer_options = build_parquet_writer_options(table.properties, table.schema(), arrow_schema, sort_columns, rows_read)
         statistics_plan = compute_statistics_plan(file_schema, table.properties)
         column_mapping = parquet_path_to_id_mapping(file_schema)
         partition_key = None if spec.is_unpartitioned() else PartitionPath(task.partition, spec, table.schema())
@@ -289,12 +292,16 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
 
         data_files: list[DataFile] = []
         path, stream, writer, file_rows = "", None, None, 0
-        bytes_per_row = task.data_bytes / max(sum(data_file.file.record_count for data_file in task.data_files), 1)
-        is_measured = False
+        bytes_per_row = task.data_bytes / max(rows_read, 1)
         try:
             for batch in reader:
                 batch = batch.rename_columns(arrow_schema.names).cast(arrow_schema)
                 while batch.num_rows:
+                    rows_per_file = max(1, int(target_file_size_bytes / bytes_per_row))
+                    row_group, batch = batch.slice(0, rows_per_file), batch.slice(rows_per_file)
+                    if writer is not None and stream.tell() + row_group.num_rows * bytes_per_row > target_file_size_bytes:
+                        data_files.append(close_file(path, stream, writer))
+                        writer = None
                     if writer is None:
                         path = location_provider.new_data_location(
                             f"{file_name_prefix}-{len(data_files):05d}.parquet",
@@ -302,20 +309,11 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
                         )
                         written_paths.append(path)
                         stream = table.io.new_output(path).create(overwrite=False)
-                        writer = pq.ParquetWriter(
-                            cast(IO[Any], stream), schema=arrow_schema, store_decimal_as_integer=True, **writer_kwargs
-                        )
+                        writer = pq.ParquetWriter(cast(IO[Any], stream), schema=arrow_schema, **writer_options)
                         file_rows = 0
-                    fill_ratio = 0.9 if is_measured else 0.5
-                    rows = max(1, int((target_file_size_bytes - stream.tell()) / bytes_per_row * fill_ratio))
-                    chunk, batch = batch.slice(0, rows), batch.slice(rows)
-                    writer.write_batch(chunk, row_group_size=chunk.num_rows)
-                    file_rows += chunk.num_rows
+                    writer.write_batch(row_group, row_group_size=row_group.num_rows)
+                    file_rows += row_group.num_rows
                     bytes_per_row = stream.tell() / file_rows
-                    is_measured = True
-                    if target_file_size_bytes - stream.tell() < max(bytes_per_row, target_file_size_bytes / 100):
-                        data_files.append(close_file(path, stream, writer))
-                        writer = None
             if writer is not None:
                 data_files.append(close_file(path, stream, writer))
                 writer = None
@@ -328,6 +326,70 @@ class Execution(LoggingMixin, compaction_phase="rewrite"):
                         self.log.warning(f"Could not close {path}", table=plan.table_name, file_path=path)
             raise
         return data_files
+
+
+def build_parquet_writer_options(
+    properties: Properties, schema: Schema, arrow_schema: pa.Schema, sort_columns: SortColumns, row_count: int
+) -> dict[str, Any]:
+    codec = properties.get(TableProperties.PARQUET_COMPRESSION, TableProperties.PARQUET_COMPRESSION_DEFAULT)
+    options: dict[str, Any] = {
+        "compression": "none" if codec == "uncompressed" else codec,
+        "compression_level": property_as_int(
+            properties, TableProperties.PARQUET_COMPRESSION_LEVEL, TableProperties.PARQUET_COMPRESSION_LEVEL_DEFAULT
+        ),
+        "data_page_size": property_as_int(
+            properties, TableProperties.PARQUET_PAGE_SIZE_BYTES, TableProperties.PARQUET_PAGE_SIZE_BYTES_DEFAULT
+        ),
+        "max_rows_per_page": property_as_int(
+            properties, TableProperties.PARQUET_PAGE_ROW_LIMIT, TableProperties.PARQUET_PAGE_ROW_LIMIT_DEFAULT
+        ),
+        "dictionary_pagesize_limit": property_as_int(
+            properties, TableProperties.PARQUET_DICT_SIZE_BYTES, TableProperties.PARQUET_DICT_SIZE_BYTES_DEFAULT
+        ),
+        "write_page_index": True,
+        "store_decimal_as_integer": True,
+    }
+
+    bloom_filter_max_bytes = cast(
+        int,
+        property_as_int(
+            properties, TableProperties.PARQUET_BLOOM_FILTER_MAX_BYTES, TableProperties.PARQUET_BLOOM_FILTER_MAX_BYTES_DEFAULT
+        ),
+    )
+    bloom_filter_options = {}
+    for name, value in properties.items():
+        column_name = name.removeprefix(f"{TableProperties.PARQUET_BLOOM_FILTER_COLUMN_ENABLED_PREFIX}.")
+        if column_name == name or value.lower() != "true" or schema.find_field(column_name, case_sensitive=False) is None:
+            continue
+        fpp = float(properties.get(f"{BLOOM_FILTER_FPP_PREFIX}.{column_name}", BLOOM_FILTER_FPP_DEFAULT))
+        max_distinct_values = int(bloom_filter_max_bytes * 8 * math.log(2) ** 2 / -math.log(fpp))
+        parquet_column_name = sanitize_column_names(schema).find_column_name(schema.find_field(column_name).field_id)
+        bloom_filter_options[parquet_column_name] = {"ndv": max(1, min(row_count, max_distinct_values)), "fpp": fpp}
+    if bloom_filter_options:
+        options["bloom_filter_options"] = bloom_filter_options
+
+    if sort_columns:
+        top_level_names = [schema_field.name for schema_field in schema.fields]
+        leaf_counts = [count_leaf_columns(arrow_field.type) for arrow_field in arrow_schema]
+        options["sorting_columns"] = [
+            pq.SortingColumn(
+                sum(leaf_counts[: top_level_names.index(column.name)]),
+                descending=column.descending,
+                nulls_first=column.nulls_first,
+            )
+            for column in sort_columns
+        ]
+    return options
+
+
+def count_leaf_columns(data_type: pa.DataType) -> int:
+    if pa.types.is_struct(data_type):
+        return sum(count_leaf_columns(field.type) for field in data_type)
+    if pa.types.is_map(data_type):
+        return count_leaf_columns(data_type.key_type) + count_leaf_columns(data_type.item_type)
+    if pa.types.is_list(data_type) or pa.types.is_large_list(data_type) or pa.types.is_fixed_size_list(data_type):
+        return count_leaf_columns(data_type.value_type)
+    return 1
 
 
 def delete_files(io: FileIO, paths: list[str]) -> list[str]:
